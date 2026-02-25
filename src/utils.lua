@@ -48,16 +48,145 @@ function PWB.utils.hoursFromNow(hours)
   return h, m
 end
 
--- Get current server time, normalized by accounting for in-game timezones.
-function PWB.utils.getServerTime()
-  local h, m = GetGameTime()
+-- Storage for server time from .server info command
+PWB.serverTime = nil
+PWB.serverTimeReceivedAt = nil
+PWB.serverTimeLastRefresh = nil
+PWB.serverTimeDriftSamples = {} -- Track received server times to detect drift
 
-  -- Continent timezone normalization
-  if PWB.isOnKalimdor then
-    h = math.mod(h + 12, 24)
+-- Parse server time from .server info output
+-- Format: "Server Time: Sun, 07.12.2025 14:47:24"
+function PWB.utils.parseServerTime(msg)
+  local _, _, hStr, mStr, sStr = string.find(msg, 'Server Time:%s*[^,]+,%s+[%d%.]+%s+(%d%d):(%d%d):(%d%d)')
+  if not hStr or not mStr or not sStr then return nil, nil end
+  
+  local h = tonumber(hStr)
+  local m = tonumber(mStr)
+  local s = tonumber(sStr)
+  
+  if h and m and s then
+    PWB.serverTime = { h = h, m = m, s = s }
+    PWB.serverTimeReceivedAt = time()
+    PWB.serverTimeLastRefresh = time()
+    return h, m
   end
+  
+  return nil, nil
+end
 
-  return h, m
+-- Get current server time, using ONLY .server info time (no fallback to GetGameTime())
+-- Returns nil, nil if server time from .server info is not available
+function PWB.utils.getServerTime()
+  -- Only use server time from .server info, never use GetGameTime()
+  if PWB.serverTime and PWB.serverTimeReceivedAt then
+    -- Calculate elapsed time using stored server time and seconds
+    local elapsed = time() - PWB.serverTimeReceivedAt
+    local elapsedSeconds = math.floor(elapsed)
+    local elapsedMinutes = math.floor(elapsedSeconds / 60)
+    local elapsedSecs = math.mod(elapsedSeconds, 60)
+    
+    local h = PWB.serverTime.h
+    local m = PWB.serverTime.m + elapsedMinutes
+    local s = (PWB.serverTime.s or 0) + elapsedSecs
+    
+    -- Handle second overflow
+    if s >= 60 then
+      m = m + math.floor(s / 60)
+      s = math.mod(s, 60)
+    end
+    
+    -- Handle minute overflow
+    if m >= 60 then
+      h = h + math.floor(m / 60)
+      m = math.mod(m, 60)
+    end
+    
+    -- Handle hour overflow
+    h = math.mod(h, 24)
+    
+    return h, m
+  end
+  
+  -- Return nil if server time from .server info is not available
+  return nil, nil
+end
+
+-- Check if received server time indicates we have drift
+-- Returns true if we should refresh our server time
+function PWB.utils.checkServerTimeDrift(receivedH, receivedM)
+  if not PWB.serverTime or not receivedH or not receivedM then
+    return false
+  end
+  
+  local ourH, ourM = PWB.utils.getServerTime()
+  if not ourH or not ourM then
+    return false
+  end
+  
+  local ourMinutes = ourH * 60 + ourM
+  local receivedMinutes = receivedH * 60 + receivedM
+  
+  -- Calculate time difference, handling midnight rollover
+  local timeDiff
+  if ourMinutes >= receivedMinutes then
+    timeDiff = ourMinutes - receivedMinutes
+    if timeDiff > 12 * 60 then -- More than 12 hours, probably rollover
+      timeDiff = (24 * 60) - ourMinutes + receivedMinutes
+    end
+  else
+    timeDiff = receivedMinutes - ourMinutes
+    if timeDiff > 12 * 60 then -- More than 12 hours, probably rollover
+      timeDiff = (24 * 60) - receivedMinutes + ourMinutes
+    end
+  end
+  
+  -- If difference is more than 2 minutes, we might have drift
+  -- Store this sample
+  if timeDiff > 2 or timeDiff < -2 then
+    table.insert(PWB.serverTimeDriftSamples, {
+      received = receivedMinutes,
+      ours = ourMinutes,
+      diff = timeDiff,
+      at = time()
+    })
+    
+    -- Keep only last 5 samples
+    local sampleCount = 0
+    for _ in ipairs(PWB.serverTimeDriftSamples) do
+      sampleCount = sampleCount + 1
+    end
+    if sampleCount > 5 then
+      table.remove(PWB.serverTimeDriftSamples, 1)
+      sampleCount = sampleCount - 1
+    end
+    
+    -- If we have 3+ samples all showing similar drift, refresh
+    if sampleCount >= 3 then
+      local consistentDrift = true
+      local avgDrift = 0
+      local count = 0
+      for _, sample in ipairs(PWB.serverTimeDriftSamples) do
+        count = count + 1
+        avgDrift = avgDrift + sample.diff
+        if count > 1 and math.abs(sample.diff - PWB.serverTimeDriftSamples[1].diff) > 1 then
+          consistentDrift = false
+          break
+        end
+      end
+      
+      if consistentDrift and count > 0 then
+        avgDrift = avgDrift / count
+        -- If average drift is more than 2 minutes, refresh
+        if math.abs(avgDrift) > 2 then
+          PWB.serverTimeDriftSamples = {} -- Clear samples
+          SendChatMessage('.server info', 'SAY')
+          return true
+        end
+      end
+    end
+  end
+  
+  return false
 end
 
 -- Get local PizzaWorldBuffs version as a semantic versioning string
@@ -188,3 +317,4 @@ function PWB.utils.getCurrentMapZoneName()
   local list = { GetMapZones(cid) }
   return list[mid]
 end
+

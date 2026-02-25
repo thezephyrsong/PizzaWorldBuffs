@@ -17,9 +17,14 @@ local BUFF_CD_HOURS = 2
 --
 -- Example:
 --   A-O-16-37-Pizzahawaii
-function PWB.core.encode(faction, boss, h, m, witness)
+function PWB.core.encode(faction, boss, h, m, witness, witnessServerH, witnessServerM)
   if not faction or not boss or not h or not m or not witness then return end
-  return string.format('%s-%s-%.2d-%.2d-%s', faction, boss, h, m, witness)
+  if witnessServerH and witnessServerM then
+    return string.format('%s-%s-%.2d-%.2d-%s-%.2d-%.2d', faction, boss, h, m, witness, witnessServerH, witnessServerM)
+  else
+    -- Backward compatibility: old format without server time
+    return string.format('%s-%s-%.2d-%.2d-%s', faction, boss, h, m, witness)
+  end
 end
 
 -- Encode all of our timers as strings, separated by semicolon.
@@ -28,18 +33,40 @@ function PWB.core.encodeAll()
   for _, timers in pairs(PWB_timers) do
     for _, timer in pairs(timers) do
       local faction, boss, h, m, witness = timer.faction, timer.boss, timer.h, timer.m, timer.witness
-      timersStr = (timersStr and timersStr .. ';' or '') .. PWB.core.encode(faction, boss, h, m, witness)
+      -- When sharing, send our CURRENT server time (login + elapsed), not the witness time
+      -- This allows receivers to compare their current time with ours
+      local currentServerH, currentServerM = PWB.utils.getServerTime()
+      local encoded = PWB.core.encode(faction, boss, h, m, witness, currentServerH, currentServerM)
+      if PWB_config and PWB_config.log then
+        if currentServerH and currentServerM then
+          PWB:Print('Encoding timer with current server time: ' .. encoded)
+        else
+          PWB:Print('Encoding timer WITHOUT server time (old format): ' .. encoded)
+        end
+      end
+      timersStr = (timersStr and timersStr .. ';' or '') .. encoded
     end
   end
   return timersStr
 end
 
 -- Decode the provided timer string into a timer table.
+-- Supports both new format (with server time) and old format (without server time) for backward compatibility.
 function PWB.core.decode(timerStr)
+  -- Try new format first: FACTION-BOSS-HH-MM-WITNESS-WITNESSSERVERH-WITNESSSERVERM
+  local _, _, faction, boss, hStr, mStr, witness, witnessServerHStr, witnessServerMStr = string.find(timerStr, '(.*)%-(.*)%-(.*)%-(.*)%-(.*)%-(.*)%-(.*)')
+  if faction and boss and hStr and mStr and witness and witnessServerHStr and witnessServerMStr then
+    return faction, boss, tonumber(hStr), tonumber(mStr), witness, tonumber(witnessServerHStr), tonumber(witnessServerMStr)
+  end
+  
+  -- Fall back to old format: FACTION-BOSS-HH-MM-WITNESS
   local _, _, faction, boss, hStr, mStr, witness = string.find(timerStr, '(.*)%-(.*)%-(.*)%-(.*)%-(.*)')
-  return faction, boss, tonumber(hStr), tonumber(mStr), witness
+  if faction and boss and hStr and mStr and witness then
+    return faction, boss, tonumber(hStr), tonumber(mStr), witness, nil, nil
+  end
+  
+  return nil, nil, nil, nil, nil, nil, nil
 end
-
 -- LOCATION-SECONDSAGO-WITNESS
 function PWB.core.encodeDmf()
   if not PWB_dmf or not PWB_dmf.location or not PWB_dmf.seenAt or not PWB_dmf.witness then
@@ -277,3 +304,4 @@ function PWB.core.publishDmfLocation()
     SendChatMessage(PWB.abbrevDmf .. ':' .. PWB.utils.getVersionNumber() .. ':' .. PWB.core.encodeDmf(), 'CHANNEL', nil, pwbChannel)
   end
 end
+
